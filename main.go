@@ -79,7 +79,6 @@ func (sc *SearchClient) GetTables() ([]TableDescription, error) {
 	client := resty.New()
 	out := []TableDescription{}
 	for nextURL := sc.BaseURL + "tables"; nextURL != ""; {
-		log.Printf("Getting: %s\n", nextURL)
 		resp, err := client.R().
 			SetHeader("Accept", "application/json").
 			Get(nextURL)
@@ -113,7 +112,6 @@ func (sc *SearchClient) GetTableRows(name string) (chan map[string]interface{}, 
 		startURL := fmt.Sprintf("%stable/%s/data", sc.BaseURL, name)
 
 		for nextURL := startURL; nextURL != ""; {
-			log.Printf("Getting: %s\n", nextURL)
 			resp, err := client.R().
 				SetHeader("Accept", "application/json").
 				Get(nextURL)
@@ -145,7 +143,6 @@ func (sc *SearchClient) GetRecordByID(table string, idField string, id string) (
 		Query: fmt.Sprintf(`SELECT * FROM %s WHERE %s = '%s'`, table, idField, id),
 		//Parameters: []string{id},
 	}
-	log.Printf("Doing Search: %s", query)
 	searchURL := sc.BaseURL + "search"
 
 	client := resty.New()
@@ -157,15 +154,12 @@ func (sc *SearchClient) GetRecordByID(table string, idField string, id string) (
 		log.Printf("Search Error: %s", err)
 		return nil, err
 	}
-
 	//follow pages until result ready
 	for {
-		log.Printf("Data: %s", resp.Body())
 		qr := QueryResult{}
 		json.Unmarshal(resp.Body(), &qr)
 		if len(qr.Data) == 0 {
 			if qr.Pagination != nil {
-				log.Printf("Next Page %s", qr.Pagination.NextPageURL)
 				resp, _ = client.R().
 					SetHeader("Accept", "application/json").
 					Get(qr.Pagination.NextPageURL)
@@ -180,6 +174,84 @@ func (sc *SearchClient) GetRecordByID(table string, idField string, id string) (
 		}
 	}
 	return nil, nil
+}
+
+func (sc *SearchClient) GetRecordsByField(table string, field string, id string) (chan map[string]interface{}, error) {
+	query := QueryRequest{
+		Query: fmt.Sprintf(`SELECT * FROM %s WHERE %s = '%s'`, table, field, id),
+		//Parameters: []string{id},
+	}
+	searchURL := sc.BaseURL + "search"
+	client := resty.New()
+	resp, err := client.R().
+		SetHeader("Accept", "application/json").
+		SetBody(query).
+		Post(searchURL)
+	if err != nil {
+		log.Printf("Search Error: %s", err)
+		return nil, err
+	}
+
+	out := make(chan map[string]interface{}, 10)
+	go func() {
+		defer close(out)
+		for {
+			qr := QueryResult{}
+			json.Unmarshal(resp.Body(), &qr)
+			for _, d := range qr.Data {
+				out <- d
+			}
+			if qr.Pagination != nil {
+				resp, _ = client.R().
+					SetHeader("Accept", "application/json").
+					Get(qr.Pagination.NextPageURL)
+			} else {
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+func (sc *SearchClient) GetTableIDs(table string, idField string) (chan string, error) {
+	out := make(chan string, 100)
+
+	go func() {
+		defer close(out)
+		query := QueryRequest{
+			Query: fmt.Sprintf(`SELECT %s FROM %s`, idField, table),
+			//Parameters: []string{id},
+		}
+		searchURL := sc.BaseURL + "search"
+		client := resty.New()
+		resp, err := client.R().
+			SetHeader("Accept", "application/json").
+			SetBody(query).
+			Post(searchURL)
+		if err != nil {
+			log.Printf("Search Error: %s", err)
+			return
+		}
+		for {
+			qr := QueryResult{}
+			json.Unmarshal(resp.Body(), &qr)
+			for _, d := range qr.Data {
+				if id, ok := d[idField]; ok {
+					if idStr, ok := id.(string); ok {
+						out <- idStr
+					}
+				}
+			}
+			if qr.Pagination != nil {
+				resp, _ = client.R().
+					SetHeader("Accept", "application/json").
+					Get(qr.Pagination.NextPageURL)
+			} else {
+				return
+			}
+		}
+	}()
+	return out, nil
 }
 
 type TableConfig struct {
@@ -219,8 +291,19 @@ func (ps *GA4GHSearchProxyServer) GetCollectionInfo(ctx context.Context, col *gr
 	return nil, fmt.Errorf("Table %s not found", col.Name)
 }
 
-func (ps *GA4GHSearchProxyServer) GetIDs(*gripper.Collection, gripper.GRIPSource_GetIDsServer) error {
-	return nil
+func (ps *GA4GHSearchProxyServer) GetIDs(col *gripper.Collection, srv gripper.GRIPSource_GetIDsServer) error {
+	if table, ok := ps.Config.Tables[col.Name]; ok {
+		ids, err := ps.client.GetTableIDs(col.Name, table.PrimaryKey)
+		if err != nil {
+			return err
+		}
+		for id := range ids {
+			o := gripper.RowID{Id: id}
+			srv.Send(&o)
+		}
+		return nil
+	}
+	return fmt.Errorf("Table %s not found", col.Name)
 }
 
 func (ps *GA4GHSearchProxyServer) GetRows(col *gripper.Collection, srv gripper.GRIPSource_GetRowsServer) error {
@@ -254,7 +337,6 @@ func (ps *GA4GHSearchProxyServer) GetRowsByID(srv gripper.GRIPSource_GetRowsByID
 			if err != nil {
 				log.Printf("Error: %s", err)
 			}
-			log.Printf("Got record %s", data)
 			s, _ := structpb.NewStruct(data)
 			idStr := ""
 			if id, ok := data[table.PrimaryKey]; ok {
@@ -271,8 +353,26 @@ func (ps *GA4GHSearchProxyServer) GetRowsByID(srv gripper.GRIPSource_GetRowsByID
 	return nil
 }
 
-func (ps *GA4GHSearchProxyServer) GetRowsByField(*gripper.FieldRequest, gripper.GRIPSource_GetRowsByFieldServer) error {
-	return nil
+func (ps *GA4GHSearchProxyServer) GetRowsByField(req *gripper.FieldRequest, srv gripper.GRIPSource_GetRowsByFieldServer) error {
+	if table, ok := ps.Config.Tables[req.Collection]; ok {
+		if _, ok := table.Fields[req.Field]; ok {
+			rows, err := ps.client.GetRecordsByField(req.Collection, req.Field, req.Value)
+			if err != nil {
+				return err
+			}
+			for r := range rows {
+				if id, ok := r[table.PrimaryKey]; ok {
+					if idStr, ok := id.(string); ok {
+						s, _ := structpb.NewStruct(r)
+						o := gripper.Row{Id: idStr, Data: s}
+						srv.Send(&o)
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("Table %s not found", req.Collection)
 }
 
 func Serve(cmd *cobra.Command, args []string) error {
@@ -299,7 +399,7 @@ func Serve(cmd *cobra.Command, args []string) error {
 	// Regsiter Query Service
 	gripper.RegisterGRIPSourceServer(grpcServer, &server)
 
-	fmt.Printf("Starting Server: %d", config.Port)
+	fmt.Printf("Starting Server: %d\n", config.Port)
 	err = grpcServer.Serve(lis)
 	return err
 }
