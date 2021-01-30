@@ -445,7 +445,7 @@ func GenConfig(cmd *cobra.Command, args []string) error {
 			}
 
 			if idField == "" {
-				log.Printf("Unable to guess field for table %s", t.Name)
+				log.Printf("Unable to guess primary key field for table %s", t.Name)
 			} else {
 				tconfig.PrimaryKey = idField
 			}
