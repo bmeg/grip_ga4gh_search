@@ -33,3 +33,21 @@ be presented by the server.
 ```
 ./grip_ga4gh_search server dnastack.config.yaml
 ```
+
+## Build GRIP 0.7.0 development branch
+```
+git clone git@github.com:bmeg/grip.git
+cd grip/
+git checkout develop-0.7.0
+go build ./
+```
+
+## List available tables
+```
+./grip er list
+```
+
+## Dump all rows from a table
+```
+./grip er rows kidsfirst.ga4gh_tables.specimen
+```
